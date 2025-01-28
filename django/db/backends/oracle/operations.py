@@ -3,7 +3,7 @@ import uuid
 from functools import lru_cache
 
 from django.conf import settings
-from django.db import DatabaseError, NotSupportedError
+from django.db import NotSupportedError
 from django.db.backends.base.operations import BaseDatabaseOperations
 from django.db.backends.utils import split_tzname_delta, strip_quotes, truncate_name
 from django.db.models import AutoField, Exists, ExpressionWrapper, Lookup
@@ -165,6 +165,9 @@ END;
 
     def datetime_extract_sql(self, lookup_type, sql, params, tzname):
         sql, params = self._convert_sql_to_tz(sql, params, tzname)
+        if lookup_type == "second":
+            # Truncate fractional seconds.
+            return f"FLOOR(EXTRACT(SECOND FROM {sql}))", params
         return self.date_extract_sql(lookup_type, sql, params)
 
     def datetime_trunc_sql(self, lookup_type, sql, params, tzname):
@@ -187,6 +190,12 @@ END;
             # Cast to DATE removes sub-second precision.
             return f"CAST({sql} AS DATE)", params
         return f"TRUNC({sql}, %s)", (*params, trunc_param)
+
+    def time_extract_sql(self, lookup_type, sql, params):
+        if lookup_type == "second":
+            # Truncate fractional seconds.
+            return f"FLOOR(EXTRACT(SECOND FROM {sql}))", params
+        return self.date_extract_sql(lookup_type, sql, params)
 
     def time_trunc_sql(self, lookup_type, sql, params, tzname=None):
         # The implementation is similar to `datetime_trunc_sql` as both
@@ -286,13 +295,6 @@ END;
         columns = []
         for param in returning_params:
             value = param.get_value()
-            if value == []:
-                raise DatabaseError(
-                    "The database did not return a new row id. Probably "
-                    '"ORA-1403: no data found" was raised internally but was '
-                    "hidden by the Oracle OCI library (see "
-                    "https://code.djangoproject.com/ticket/28859)."
-                )
             columns.append(value[0])
         return tuple(columns)
 
@@ -317,7 +319,7 @@ END;
         # Unlike Psycopg's `query` and MySQLdb`'s `_executed`, oracledb's
         # `statement` doesn't contain the query parameters. Substitute
         # parameters manually.
-        if params:
+        if statement and params:
             if isinstance(params, (tuple, list)):
                 params = {
                     f":arg{i}": param for i, param in enumerate(dict.fromkeys(params))
@@ -338,9 +340,10 @@ END;
     def lookup_cast(self, lookup_type, internal_type=None):
         if lookup_type in ("iexact", "icontains", "istartswith", "iendswith"):
             return "UPPER(%s)"
-        if (
-            lookup_type != "isnull" and internal_type in ("BinaryField", "TextField")
-        ) or (lookup_type == "exact" and internal_type == "JSONField"):
+        if lookup_type != "isnull" and internal_type in (
+            "BinaryField",
+            "TextField",
+        ):
             return "DBMS_LOB.SUBSTR(%s)"
         return "%s"
 
@@ -590,10 +593,6 @@ END;
         if value is None:
             return None
 
-        # Expression values are adapted by the database.
-        if hasattr(value, "resolve_expression"):
-            return value
-
         # oracledb doesn't support tz-aware datetimes
         if timezone.is_aware(value):
             if settings.USE_TZ:
@@ -610,10 +609,6 @@ END;
         if value is None:
             return None
 
-        # Expression values are adapted by the database.
-        if hasattr(value, "resolve_expression"):
-            return value
-
         if isinstance(value, str):
             return datetime.datetime.strptime(value, "%H:%M:%S")
 
@@ -624,9 +619,6 @@ END;
         return Oracle_datetime(
             1900, 1, 1, value.hour, value.minute, value.second, value.microsecond
         )
-
-    def adapt_decimalfield_value(self, value, max_digits=None, decimal_places=None):
-        return value
 
     def combine_expression(self, connector, sub_expressions):
         lhs, rhs = sub_expressions
@@ -667,18 +659,20 @@ END;
         return self._get_no_autofield_sequence_name(table) if row is None else row[0]
 
     def bulk_insert_sql(self, fields, placeholder_rows):
+        field_placeholders = [
+            BulkInsertMapper.types.get(
+                getattr(field, "target_field", field).get_internal_type(), "%s"
+            )
+            for field in fields
+            if field
+        ]
         query = []
         for row in placeholder_rows:
             select = []
             for i, placeholder in enumerate(row):
                 # A model without any fields has fields=[None].
                 if fields[i]:
-                    internal_type = getattr(
-                        fields[i], "target_field", fields[i]
-                    ).get_internal_type()
-                    placeholder = (
-                        BulkInsertMapper.types.get(internal_type, "%s") % placeholder
-                    )
+                    placeholder = field_placeholders[i] % placeholder
                 # Add columns aliases to the first select to avoid "ORA-00918:
                 # column ambiguously defined" when two or more columns in the
                 # first select have the same value.

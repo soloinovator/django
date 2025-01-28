@@ -1,6 +1,7 @@
 """
 Tests for django test runner
 """
+
 import collections.abc
 import multiprocessing
 import os
@@ -14,7 +15,7 @@ from django import db
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
-from django.core.management.base import CommandError, SystemCheckError
+from django.core.management.base import SystemCheckError
 from django.test import SimpleTestCase, TransactionTestCase, skipUnlessDBFeature
 from django.test.runner import (
     DiscoverRunner,
@@ -31,7 +32,6 @@ from django.test.utils import (
     get_unique_databases_and_mirrors,
     iter_test_cases,
 )
-from django.utils.version import PY312
 
 from .models import B, Person, Through
 
@@ -478,7 +478,6 @@ class ManageCommandTests(unittest.TestCase):
             )
         self.assertIn("Total run took", stderr.getvalue())
 
-    @unittest.skipUnless(PY312, "unittest --durations option requires Python 3.12")
     def test_durations(self):
         with captured_stderr() as stderr:
             call_command(
@@ -489,22 +488,12 @@ class ManageCommandTests(unittest.TestCase):
             )
         self.assertIn("durations=10", stderr.getvalue())
 
-    @unittest.skipIf(PY312, "unittest --durations option requires Python 3.12")
-    def test_durations_lt_py312(self):
-        msg = "Error: unrecognized arguments: --durations=10"
-        with self.assertRaises(CommandError, msg=msg):
-            call_command(
-                "test",
-                "--durations=10",
-                "sites",
-                testrunner="test_runner.tests.MockTestRunner",
-            )
-
 
 # Isolate from the real environment.
 @mock.patch.dict(os.environ, {}, clear=True)
 @mock.patch.object(multiprocessing, "cpu_count", return_value=12)
 class ManageCommandParallelTests(SimpleTestCase):
+    @mock.patch.object(multiprocessing, "get_start_method", return_value="fork")
     def test_parallel_default(self, *mocked_objects):
         with captured_stderr() as stderr:
             call_command(
@@ -514,6 +503,7 @@ class ManageCommandParallelTests(SimpleTestCase):
             )
         self.assertIn("parallel=12", stderr.getvalue())
 
+    @mock.patch.object(multiprocessing, "get_start_method", return_value="fork")
     def test_parallel_auto(self, *mocked_objects):
         with captured_stderr() as stderr:
             call_command(
@@ -549,12 +539,14 @@ class ManageCommandParallelTests(SimpleTestCase):
         self.assertEqual(stderr.getvalue(), "")
 
     @mock.patch.dict(os.environ, {"DJANGO_TEST_PROCESSES": "7"})
+    @mock.patch.object(multiprocessing, "get_start_method", return_value="fork")
     def test_no_parallel_django_test_processes_env(self, *mocked_objects):
         with captured_stderr() as stderr:
             call_command("test", testrunner="test_runner.tests.MockTestRunner")
         self.assertEqual(stderr.getvalue(), "")
 
     @mock.patch.dict(os.environ, {"DJANGO_TEST_PROCESSES": "invalid"})
+    @mock.patch.object(multiprocessing, "get_start_method", return_value="fork")
     def test_django_test_processes_env_non_int(self, *mocked_objects):
         with self.assertRaises(ValueError):
             call_command(
@@ -564,6 +556,7 @@ class ManageCommandParallelTests(SimpleTestCase):
             )
 
     @mock.patch.dict(os.environ, {"DJANGO_TEST_PROCESSES": "7"})
+    @mock.patch.object(multiprocessing, "get_start_method", return_value="fork")
     def test_django_test_processes_parallel_default(self, *mocked_objects):
         for parallel in ["--parallel", "--parallel=auto"]:
             with self.subTest(parallel=parallel):
@@ -992,17 +985,21 @@ class RunTestsExceptionHandlingTests(unittest.TestCase):
         """
         Teardown functions are run when run_checks() raises SystemCheckError.
         """
-        with mock.patch(
-            "django.test.runner.DiscoverRunner.setup_test_environment"
-        ), mock.patch("django.test.runner.DiscoverRunner.setup_databases"), mock.patch(
-            "django.test.runner.DiscoverRunner.build_suite"
-        ), mock.patch(
-            "django.test.runner.DiscoverRunner.run_checks", side_effect=SystemCheckError
-        ), mock.patch(
-            "django.test.runner.DiscoverRunner.teardown_databases"
-        ) as teardown_databases, mock.patch(
-            "django.test.runner.DiscoverRunner.teardown_test_environment"
-        ) as teardown_test_environment:
+        with (
+            mock.patch("django.test.runner.DiscoverRunner.setup_test_environment"),
+            mock.patch("django.test.runner.DiscoverRunner.setup_databases"),
+            mock.patch("django.test.runner.DiscoverRunner.build_suite"),
+            mock.patch(
+                "django.test.runner.DiscoverRunner.run_checks",
+                side_effect=SystemCheckError,
+            ),
+            mock.patch(
+                "django.test.runner.DiscoverRunner.teardown_databases"
+            ) as teardown_databases,
+            mock.patch(
+                "django.test.runner.DiscoverRunner.teardown_test_environment"
+            ) as teardown_test_environment,
+        ):
             runner = DiscoverRunner(verbosity=0, interactive=False)
             with self.assertRaises(SystemCheckError):
                 runner.run_tests(
@@ -1016,18 +1013,22 @@ class RunTestsExceptionHandlingTests(unittest.TestCase):
         SystemCheckError is surfaced when run_checks() raises SystemCheckError
         and teardown databases() raises ValueError.
         """
-        with mock.patch(
-            "django.test.runner.DiscoverRunner.setup_test_environment"
-        ), mock.patch("django.test.runner.DiscoverRunner.setup_databases"), mock.patch(
-            "django.test.runner.DiscoverRunner.build_suite"
-        ), mock.patch(
-            "django.test.runner.DiscoverRunner.run_checks", side_effect=SystemCheckError
-        ), mock.patch(
-            "django.test.runner.DiscoverRunner.teardown_databases",
-            side_effect=ValueError,
-        ) as teardown_databases, mock.patch(
-            "django.test.runner.DiscoverRunner.teardown_test_environment"
-        ) as teardown_test_environment:
+        with (
+            mock.patch("django.test.runner.DiscoverRunner.setup_test_environment"),
+            mock.patch("django.test.runner.DiscoverRunner.setup_databases"),
+            mock.patch("django.test.runner.DiscoverRunner.build_suite"),
+            mock.patch(
+                "django.test.runner.DiscoverRunner.run_checks",
+                side_effect=SystemCheckError,
+            ),
+            mock.patch(
+                "django.test.runner.DiscoverRunner.teardown_databases",
+                side_effect=ValueError,
+            ) as teardown_databases,
+            mock.patch(
+                "django.test.runner.DiscoverRunner.teardown_test_environment"
+            ) as teardown_test_environment,
+        ):
             runner = DiscoverRunner(verbosity=0, interactive=False)
             with self.assertRaises(SystemCheckError):
                 runner.run_tests(
@@ -1041,18 +1042,19 @@ class RunTestsExceptionHandlingTests(unittest.TestCase):
         Exceptions on teardown are surfaced if no exceptions happen during
         run_checks().
         """
-        with mock.patch(
-            "django.test.runner.DiscoverRunner.setup_test_environment"
-        ), mock.patch("django.test.runner.DiscoverRunner.setup_databases"), mock.patch(
-            "django.test.runner.DiscoverRunner.build_suite"
-        ), mock.patch(
-            "django.test.runner.DiscoverRunner.run_checks"
-        ), mock.patch(
-            "django.test.runner.DiscoverRunner.teardown_databases",
-            side_effect=ValueError,
-        ) as teardown_databases, mock.patch(
-            "django.test.runner.DiscoverRunner.teardown_test_environment"
-        ) as teardown_test_environment:
+        with (
+            mock.patch("django.test.runner.DiscoverRunner.setup_test_environment"),
+            mock.patch("django.test.runner.DiscoverRunner.setup_databases"),
+            mock.patch("django.test.runner.DiscoverRunner.build_suite"),
+            mock.patch("django.test.runner.DiscoverRunner.run_checks"),
+            mock.patch(
+                "django.test.runner.DiscoverRunner.teardown_databases",
+                side_effect=ValueError,
+            ) as teardown_databases,
+            mock.patch(
+                "django.test.runner.DiscoverRunner.teardown_test_environment"
+            ) as teardown_test_environment,
+        ):
             runner = DiscoverRunner(verbosity=0, interactive=False)
             with self.assertRaises(ValueError):
                 # Suppress the output when running TestDjangoTestCase.
