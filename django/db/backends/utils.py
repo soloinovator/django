@@ -151,7 +151,7 @@ class CursorDebugWrapper(CursorWrapper):
             logger.debug(
                 "(%.3f) %s; args=%s; alias=%s",
                 duration,
-                sql,
+                self.db.ops.format_debug_sql(sql),
                 params,
                 self.db.alias,
                 extra={
@@ -200,6 +200,8 @@ def split_tzname_delta(tzname):
         if sign in tzname:
             name, offset = tzname.rsplit(sign, 1)
             if offset and parse_time(offset):
+                if ":" not in offset:
+                    offset = f"{offset}:00"
                 return name, sign, offset
     return tzname, None, None
 

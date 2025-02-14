@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import traceback
 import unittest
 import warnings
 from io import StringIO
@@ -48,7 +49,6 @@ from django.test.utils import (
 )
 from django.urls import NoReverseMatch, path, reverse, reverse_lazy
 from django.utils.html import VOID_ELEMENTS
-from django.utils.version import PY311
 
 from .models import Car, Person, PossessedCar
 from .views import empty_response
@@ -102,11 +102,9 @@ class SkippingTestCase(SimpleTestCase):
             SkipTestCase("test_foo").test_foo,
             ValueError,
             "skipUnlessDBFeature cannot be used on test_foo (test_utils.tests."
-            "SkippingTestCase.test_skip_unless_db_feature.<locals>.SkipTestCase%s) "
-            "as SkippingTestCase.test_skip_unless_db_feature.<locals>.SkipTestCase "
-            "doesn't allow queries against the 'default' database."
-            # Python 3.11 uses fully qualified test name in the output.
-            % (".test_foo" if PY311 else ""),
+            "SkippingTestCase.test_skip_unless_db_feature.<locals>.SkipTestCase."
+            "test_foo) as SkippingTestCase.test_skip_unless_db_feature.<locals>."
+            "SkipTestCase doesn't allow queries against the 'default' database.",
         )
 
     def test_skip_if_db_feature(self):
@@ -149,15 +147,15 @@ class SkippingTestCase(SimpleTestCase):
             SkipTestCase("test_foo").test_foo,
             ValueError,
             "skipIfDBFeature cannot be used on test_foo (test_utils.tests."
-            "SkippingTestCase.test_skip_if_db_feature.<locals>.SkipTestCase%s) "
+            "SkippingTestCase.test_skip_if_db_feature.<locals>.SkipTestCase.test_foo) "
             "as SkippingTestCase.test_skip_if_db_feature.<locals>.SkipTestCase "
-            "doesn't allow queries against the 'default' database."
-            # Python 3.11 uses fully qualified test name in the output.
-            % (".test_foo" if PY311 else ""),
+            "doesn't allow queries against the 'default' database.",
         )
 
 
-class SkippingClassTestCase(TestCase):
+class SkippingClassTestCase(TransactionTestCase):
+    available_apps = []
+
     def test_skip_class_unless_db_feature(self):
         @skipUnlessDBFeature("__class__")
         class NotSkippedTests(TestCase):
@@ -182,9 +180,11 @@ class SkippingClassTestCase(TestCase):
         except unittest.SkipTest:
             self.fail("SkipTest should not be raised here.")
         result = unittest.TextTestRunner(stream=StringIO()).run(test_suite)
-        # PY312: Python 3.12.1+ no longer includes skipped tests in the number
-        # of running tests.
-        self.assertEqual(result.testsRun, 1 if sys.version_info >= (3, 12, 1) else 3)
+        # PY312: Python 3.12.1 does not include skipped tests in the number of
+        # running tests.
+        self.assertEqual(
+            result.testsRun, 1 if sys.version_info[:3] == (3, 12, 1) else 3
+        )
         self.assertEqual(len(result.skipped), 2)
         self.assertEqual(result.skipped[0][1], "Database has feature(s) __class__")
         self.assertEqual(result.skipped[1][1], "Database has feature(s) __class__")
@@ -1041,7 +1041,7 @@ class InHTMLTests(SimpleTestCase):
     def test_long_haystack(self):
         haystack = (
             "<p>This is a very very very very very very very very long message which "
-            "exceedes the max limit of truncation.</p>"
+            "exceeds the max limit of truncation.</p>"
         )
         msg = f"Couldn't find '<b>Hello</b>' in the following response\n{haystack!r}"
         with self.assertRaisesMessage(AssertionError, msg):
@@ -1108,6 +1108,19 @@ class JSONEqualTests(SimpleTestCase):
             self.assertJSONNotEqual(invalid_json, valid_json)
         with self.assertRaises(AssertionError):
             self.assertJSONNotEqual(valid_json, invalid_json)
+
+    def test_method_frames_ignored_by_unittest(self):
+        try:
+            self.assertJSONEqual("1", "2")
+        except AssertionError:
+            exc_type, exc, tb = sys.exc_info()
+
+        result = unittest.TestResult()
+        result.addFailure(self, (exc_type, exc, tb))
+        stack = traceback.extract_tb(exc.__traceback__)
+        self.assertEqual(len(stack), 1)
+        # Top element in the stack is this method, not assertJSONEqual.
+        self.assertEqual(stack[-1].name, "test_method_frames_ignored_by_unittest")
 
 
 class XMLEqualTests(SimpleTestCase):
@@ -1196,7 +1209,7 @@ class XMLEqualTests(SimpleTestCase):
 
 
 class SkippingExtraTests(TestCase):
-    fixtures = ["should_not_be_loaded.json"]
+    fixtures = ["person.json"]
 
     # HACK: This depends on internals of our TestCase subclasses
     def __call__(self, result=None):
@@ -2128,12 +2141,48 @@ class AllowedDatabaseQueriesTests(SimpleTestCase):
         next(Car.objects.iterator(), None)
 
     def test_allowed_threaded_database_queries(self):
+        connections_dict = {}
+
         def thread_func():
+            # Passing django.db.connection between threads doesn't work while
+            # connections[DEFAULT_DB_ALIAS] does.
+            from django.db import connections
+
+            connection = connections["default"]
+
             next(Car.objects.iterator(), None)
 
-        t = threading.Thread(target=thread_func)
-        t.start()
-        t.join()
+            # Allow thread sharing so the connection can be closed by the main
+            # thread.
+            connection.inc_thread_sharing()
+            connections_dict[id(connection)] = connection
+
+        try:
+            t = threading.Thread(target=thread_func)
+            t.start()
+            t.join()
+        finally:
+            # Finish by closing the connections opened by the other threads
+            # (the connection opened in the main thread will automatically be
+            # closed on teardown).
+            for conn in connections_dict.values():
+                if conn is not connection and conn.allow_thread_sharing:
+                    conn.validate_thread_sharing()
+                    conn._close()
+                    conn.dec_thread_sharing()
+
+    def test_allowed_database_copy_queries(self):
+        new_connection = connection.copy("dynamic_connection")
+        try:
+            with new_connection.cursor() as cursor:
+                sql = f"SELECT 1{new_connection.features.bare_select_suffix}"
+                cursor.execute(sql)
+                self.assertEqual(cursor.fetchone()[0], 1)
+        finally:
+            new_connection.validate_thread_sharing()
+            new_connection._close()
+            if hasattr(new_connection, "close_pool"):
+                new_connection.close_pool()
 
 
 class DatabaseAliasTests(SimpleTestCase):

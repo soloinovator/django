@@ -2,6 +2,7 @@
  This module houses the GEOS ctypes prototype functions for the
  unary and binary predicate operations on geometries.
 """
+
 from ctypes import c_byte, c_char_p, c_double
 
 from django.contrib.gis.geos.libgeos import GEOM_PTR, GEOSFuncFactory
@@ -23,6 +24,7 @@ class BinaryPredicate(UnaryPredicate):
 
 # ## Unary Predicates ##
 geos_hasz = UnaryPredicate("GEOSHasZ")
+geos_hasm = UnaryPredicate("GEOSHasM")
 geos_isclosed = UnaryPredicate("GEOSisClosed")
 geos_isempty = UnaryPredicate("GEOSisEmpty")
 geos_isring = UnaryPredicate("GEOSisRing")
